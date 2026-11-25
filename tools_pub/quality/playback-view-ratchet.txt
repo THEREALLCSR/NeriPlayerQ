@@ -1,0 +1,13 @@
+# UI 直读 PlayerManager 播放状态流的基线（棘轮：只许减少）
+# 新增直读请改用 moe.ouom.neriplayer.core.player.host.playbackViewState。
+# 每行格式：相对路径<TAB>允许的直读次数
+app/src/main/java/moe/ouom/neriplayer/ui/navigation/AppNavigationScaffold.kt	3
+app/src/main/java/moe/ouom/neriplayer/ui/screen/history/RecentScreen.kt	2
+app/src/main/java/moe/ouom/neriplayer/ui/screen/nowplaying/edit/NowPlayingSongEditPlaybackPort.kt	1
+app/src/main/java/moe/ouom/neriplayer/ui/screen/nowplaying/edit/NowPlayingSongEditSheet.kt	1
+app/src/main/java/moe/ouom/neriplayer/ui/screen/nowplaying/NowPlayingPlaybackControls.kt	2
+app/src/main/java/moe/ouom/neriplayer/ui/screen/nowplaying/NowPlayingQueueSheet.kt	1
+app/src/main/java/moe/ouom/neriplayer/ui/screen/nowplaying/NowPlayingSecondaryActions.kt	3
+app/src/main/java/moe/ouom/neriplayer/ui/screen/playlist/curation/AppLocalCurationPorts.kt	3
+app/src/main/java/moe/ouom/neriplayer/ui/screen/playlist/QqMusicPlaylistDetailScreen.kt	1
+app/src/main/java/moe/ouom/neriplayer/ui/viewmodel/playlist/YouTubeMusicPlaylistDetailViewModel.kt	1

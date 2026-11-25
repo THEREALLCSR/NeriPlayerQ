@@ -1,0 +1,395 @@
+package moe.ouom.neriplayer.ui.viewmodel
+
+import moe.ouom.neriplayer.data.sync.store.github.SecureTokenStorage
+
+import moe.ouom.neriplayer.api.sync.github.GitHubApiException
+import moe.ouom.neriplayer.api.sync.github.TokenExpiredException
+
+import moe.ouom.neriplayer.data.sync.host.createGitHubSyncClient
+
+/*
+ * NeriPlayer - A unified Android player for streaming music and videos from multiple online platforms.
+ * Copyright (C) 2025-2025 NeriPlayer developers
+ * https://github.com/cwuom/NeriPlayer
+ *
+ * This software is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This software is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this software.
+ * If not, see <https://www.gnu.org/licenses/>.
+ *
+ * File: moe.ouom.neriplayer.ui.viewmodel/GitHubSyncViewModel
+ * Created: 2025/1/7
+ */
+
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import moe.ouom.neriplayer.common.R as CoreCommonR
+import moe.ouom.neriplayer.ui.i18n.UiText
+import moe.ouom.neriplayer.data.model.sync.DEFAULT_SYNC_AUTO_ENABLED
+import moe.ouom.neriplayer.data.sync.github.*
+import moe.ouom.neriplayer.data.model.sync.SyncResult
+import moe.ouom.neriplayer.data.sync.runtime.SyncProtocolUpgradeChallenge
+import moe.ouom.neriplayer.data.sync.runtime.SyncProtocolUpgradeRequiredException
+
+/**
+ * GitHub 同步 ViewModel
+ */
+class GitHubSyncViewModel : ViewModel() {
+
+    private val _uiState = MutableStateFlow(GitHubSyncUiState())
+    val uiState: StateFlow<GitHubSyncUiState> = _uiState
+
+    private var storage: SecureTokenStorage? = null
+    internal var syncOperation: (suspend () -> Result<SyncResult>)? = null
+    internal var targetSyncOperation: (suspend (String) -> Result<SyncResult>)? = null
+    internal var ioDispatcher: CoroutineDispatcher = Dispatchers.IO
+    private var syncJob: Job? = null
+    private var completionTimeJob: Job? = null
+
+    fun initialize(context: Context) {
+        val appContext = context.applicationContext
+        viewModelScope.launch {
+            withContext(ioDispatcher) {
+                if (storage == null) {
+                    storage = SecureTokenStorage(appContext)
+                    val manager = GitHubSyncManager.getInstance(appContext)
+                    syncOperation = manager::performSync
+                    targetSyncOperation = manager::performSyncForTarget
+                }
+                loadConfiguration()
+            }
+            if (completionTimeJob?.isActive != true) {
+                val store = storage ?: return@launch
+                completionTimeJob = viewModelScope.launch {
+                    store.observeLastCompletedSyncTime().collect { timestamp ->
+                        _uiState.update { it.copy(lastSyncTime = timestamp) }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 加载配置
+     */
+    private fun loadConfiguration() {
+        val store = storage ?: return
+        _uiState.update {
+            it.copy(
+                isConfigured = store.isConfigured(),
+                autoSyncEnabled = store.isAutoSyncEnabled(),
+                repoOwner = store.getRepoOwner() ?: "",
+                repoName = store.getRepoName() ?: "",
+                lastSyncTime = store.getLastCompletedSyncTime()
+            )
+        }
+    }
+
+    /**
+     * 验证Token
+     */
+    fun validateToken(context: Context, token: String) {
+        val appContext = context.applicationContext
+        _uiState.value = _uiState.value.copy(isValidating = true, errorMessage = null)
+
+        viewModelScope.launch {
+            val apiClient = createGitHubSyncClient(appContext, token)
+            val result = apiClient.validateToken()
+
+            if (result.isSuccess) {
+                val username = result.getOrNull() ?: "Unknown"
+                storage?.saveToken(token)
+                _uiState.value = _uiState.value.copy(
+                    isValidating = false,
+                    tokenValid = true,
+                    username = username,
+                    successMessage = feedbackText(CoreCommonR.string.github_token_verify_success, username)
+                )
+            } else {
+                _uiState.value = _uiState.value.copy(
+                    isValidating = false,
+                    tokenValid = false,
+                    errorMessage = feedbackText(
+                        CoreCommonR.string.github_token_verify_failed,
+                        syncFailureText(result.exceptionOrNull(), CoreCommonR.string.github_sync_failed_message)
+                    )
+                )
+            }
+        }
+    }
+
+    /**
+     * 创建仓库
+     */
+    fun createRepository(context: Context, repoName: String) {
+        val appContext = context.applicationContext
+        val token = storage?.getToken()
+        if (token == null) {
+            _uiState.value = _uiState.value.copy(errorMessage = feedbackText(CoreCommonR.string.github_token_required))
+            return
+        }
+
+        _uiState.value = _uiState.value.copy(isCreatingRepo = true, errorMessage = null)
+
+        viewModelScope.launch {
+            val apiClient = createGitHubSyncClient(appContext, token)
+            val result = apiClient.createRepository(repoName)
+
+            if (result.isSuccess) {
+                val repo = result.getOrNull()!!
+                storage?.saveRepository(repo.fullName.split("/")[0], repo.name)
+                _uiState.value = _uiState.value.copy(
+                    isCreatingRepo = false,
+                    repoOwner = repo.fullName.split("/")[0],
+                    repoName = repo.name,
+                    isConfigured = true,
+                    successMessage = feedbackText(CoreCommonR.string.github_repo_create_success, repo.fullName)
+                )
+            } else {
+                _uiState.value = _uiState.value.copy(
+                    isCreatingRepo = false,
+                    errorMessage = feedbackText(
+                        CoreCommonR.string.github_repo_create_failed,
+                        syncFailureText(result.exceptionOrNull(), CoreCommonR.string.github_sync_failed_message)
+                    )
+                )
+            }
+        }
+    }
+
+    /**
+     * 使用现有仓库
+     */
+    fun useExistingRepository(context: Context, fullRepoName: String) {
+        val appContext = context.applicationContext
+        val token = storage?.getToken()
+        if (token == null) {
+            _uiState.value = _uiState.value.copy(errorMessage = feedbackText(CoreCommonR.string.github_token_required))
+            return
+        }
+
+        val parts = fullRepoName.split("/")
+        if (parts.size != 2) {
+            _uiState.value = _uiState.value.copy(errorMessage = feedbackText(CoreCommonR.string.github_repo_format_error))
+            return
+        }
+
+        val owner = parts[0]
+        val repo = parts[1]
+
+        _uiState.value = _uiState.value.copy(isCheckingRepo = true, errorMessage = null)
+
+        viewModelScope.launch {
+            val apiClient = createGitHubSyncClient(appContext, token)
+            val result = apiClient.checkRepository(owner, repo)
+
+            if (result.isSuccess) {
+                storage?.saveRepository(owner, repo)
+                _uiState.value = _uiState.value.copy(
+                    isCheckingRepo = false,
+                    repoOwner = owner,
+                    repoName = repo,
+                    isConfigured = true,
+                    successMessage = feedbackText(CoreCommonR.string.github_repo_config_success, fullRepoName)
+                )
+            } else {
+                val error = result.exceptionOrNull()
+                _uiState.value = _uiState.value.copy(
+                    isCheckingRepo = false,
+                    errorMessage = when (error) {
+                        is TokenExpiredException -> feedbackText(CoreCommonR.string.github_token_expired)
+                        is GitHubApiException if error.statusCode == 404 -> feedbackText(
+                            CoreCommonR.string.github_repo_not_found,
+                            fullRepoName
+                        )
+
+                        else -> feedbackText(
+                            CoreCommonR.string.github_sync_failed,
+                            syncFailureText(error, CoreCommonR.string.github_sync_failed_message)
+                        )
+                    }
+                )
+            }
+        }
+    }
+
+    /**
+     * 执行同步
+     */
+    fun performSyncForTarget(
+        context: Context,
+        targetId: String,
+        onFinished: () -> Unit = {},
+        onUpgradeRequired: ((SyncProtocolUpgradeChallenge) -> Unit)? = null
+    ) {
+        val operation = targetSyncOperation ?: return
+        if (targetId.isBlank()) return
+        startSync(context, { operation(targetId) }, onUpgradeRequired, onFinished)
+    }
+
+    fun performSync(context: Context, onUpgradeRequired: ((SyncProtocolUpgradeChallenge) -> Unit)? = null) {
+        val operation = syncOperation ?: return
+        startSync(context, operation, onUpgradeRequired)
+    }
+
+    private fun startSync(
+        context: Context,
+        operation: suspend () -> Result<SyncResult>,
+        onUpgradeRequired: ((SyncProtocolUpgradeChallenge) -> Unit)?,
+        onFinished: () -> Unit = {}
+    ) {
+        if (syncJob?.isActive == true) return
+        val appContext = context.applicationContext
+        _uiState.value = _uiState.value.copy(isSyncing = true, errorMessage = null, syncResult = null, successMessage = null)
+
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            val result = operation()
+            coroutineContext.ensureActive()
+            if (syncJob !== coroutineContext[Job]) return@launch
+
+            if (result.isSuccess) {
+                val syncResult = result.getOrNull()!!
+                if (syncResult.success) {
+                    val lastSyncTime = storage?.getLastCompletedSyncTime() ?: _uiState.value.lastSyncTime
+                    _uiState.update {
+                        it.copy(
+                            isSyncing = false,
+                            syncResult = syncResult,
+                            lastSyncTime = lastSyncTime,
+                            successMessage = syncResultText(syncResult, webDav = false)
+                        )
+                    }
+
+                    if (_uiState.value.autoSyncEnabled) {
+                        GitHubSyncWorker.schedulePeriodicSync(appContext)
+                    }
+                } else {
+                    _uiState.value = _uiState.value.copy(
+                        isSyncing = false,
+                        errorMessage = syncResultText(syncResult, webDav = false)
+                    )
+                }
+            } else {
+                val error = result.exceptionOrNull()
+                val challenge = (error as? SyncProtocolUpgradeRequiredException)?.challenge
+                if (challenge != null && onUpgradeRequired != null) {
+                    _uiState.value = _uiState.value.copy(isSyncing = false)
+                    onUpgradeRequired(challenge)
+                    return@launch
+                }
+                if (error is GitHubSyncInProgressException) {
+                    _uiState.value = _uiState.value.copy(
+                        isSyncing = false,
+                        successMessage = feedbackText(CoreCommonR.string.github_sync_in_progress)
+                    )
+                    return@launch
+                }
+                // 检查是否是Token过期
+                if (error is TokenExpiredException) {
+                    // Token过期，清除配置
+                    clearConfiguration(appContext)
+                    _uiState.value = _uiState.value.copy(
+                        isSyncing = false,
+                        errorMessage = feedbackText(CoreCommonR.string.github_token_expired)
+                    )
+                } else {
+                    _uiState.value = _uiState.value.copy(
+                        isSyncing = false,
+                        errorMessage = feedbackText(
+                            CoreCommonR.string.github_sync_failed,
+                            syncFailureText(error, CoreCommonR.string.github_sync_failed_message)
+                        )
+                    )
+                }
+            }
+        }
+        syncJob = job
+        job.invokeOnCompletion {
+            if (syncJob === job) {
+                syncJob = null
+                _uiState.value = _uiState.value.copy(isSyncing = false)
+                onFinished()
+            }
+        }
+        job.start()
+    }
+
+    /**
+     * 切换自动同步
+     */
+    fun toggleAutoSync(context: Context, enabled: Boolean) {
+        val appContext = context.applicationContext
+        storage?.setAutoSyncEnabled(enabled)
+        _uiState.value = _uiState.value.copy(autoSyncEnabled = enabled)
+
+        if (enabled) {
+            GitHubSyncWorker.schedulePeriodicSync(appContext)
+        } else {
+            GitHubSyncWorker.cancelAllSync(appContext)
+        }
+    }
+
+    /**
+     * 清除配置
+     */
+    fun clearConfiguration(context: Context) {
+        val appContext = context.applicationContext
+        val activeSync = syncJob
+        syncJob = null
+        activeSync?.cancel()
+        storage?.clearAll()
+        GitHubSyncWorker.cancelAllSync(appContext)
+        _uiState.value = GitHubSyncUiState()
+    }
+
+    /**
+     * 清除消息
+     */
+    fun clearMessages() {
+        _uiState.value = _uiState.value.copy(
+            successMessage = null,
+            errorMessage = null
+        )
+    }
+}
+
+/**
+ * GitHub 同步 UI 状态
+ */
+data class GitHubSyncUiState(
+    val isConfigured: Boolean = false,
+    val isValidating: Boolean = false,
+    val isCreatingRepo: Boolean = false,
+    val isCheckingRepo: Boolean = false,
+    val isSyncing: Boolean = false,
+    val tokenValid: Boolean = false,
+    val autoSyncEnabled: Boolean = DEFAULT_SYNC_AUTO_ENABLED,
+    val username: String = "",
+    val repoOwner: String = "",
+    val repoName: String = "",
+    val lastSyncTime: Long = 0L,
+    val syncResult: SyncResult? = null,
+    val successMessage: UiText? = null,
+    val errorMessage: UiText? = null
+)
